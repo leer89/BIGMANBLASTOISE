@@ -6,14 +6,16 @@ signs each one in with the credentials in costco.env, then waits for a product p
 to go live. Profile 01 is the "scout" and is the only one that polls. When the
 scout sees the page change, every profile loads the product URL at once (so each
 one gets its own queue spot), and when any profile reaches a buyable page the bot
-brings that window to the front, beeps until you press Enter, and optionally pushes
-a phone notification through ntfy.sh.
+brings that window to the front, beeps, optionally pushes a phone notification
+through ntfy.sh, and asks in the console whether to buy.
 
-The bot never clicks "Add to Cart" or checks out. That part is yours.
+It only buys on an explicit "y": then the winning window adds 1 to the cart, checks
+out and clicks Place Order once. Safety stops hand the window back to you (CVV
+prompt, --max-price exceeded, unexpected page). See README.md and docs/TECHNICAL.md.
 
 Usage:
-    py costco_bot.py                      # defaults below
-    py costco_bot.py --count 10 --sku 2007501 --interval 20
+    py costco_bot.py                      # asks which SKU to watch
+    py costco_bot.py --count 10 --sku 2007501 --max-price 90
 """
 
 import argparse
@@ -21,6 +23,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -299,11 +302,145 @@ async def wait_for_port(port: int, timeout: float = 30) -> None:
 
 
 # --------------------------------------------------------------------------- main loop
+# --------------------------------------------------------------------------- buying
+CART_URL = os.environ.get("COSTCO_BOT_CART_URL", "https://www.costco.com/CheckoutCartDisplayView")  # env override is for the test harness
+_PRICE_RE = re.compile(r"\$\s?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)")
+
+
+def parse_price(text: str) -> float | None:
+    m = _PRICE_RE.search(text or "")
+    return float(m.group(1).replace(",", "")) if m else None
+
+
+async def product_summary(page: Page) -> tuple[str, float | None]:
+    """Best-effort item name and price off the product page, shown in the buy prompt."""
+    title = ""
+    for sel in ("h1", "[automation-id='productName']", "title"):
+        try:
+            loc = page.locator(sel).first
+            if await loc.count():
+                title = (await loc.inner_text(timeout=2000)).strip()
+                if title:
+                    break
+        except Exception:
+            pass
+    price = None
+    for sel in ("[automation-id='productPriceOutput']", ".price", "#pull-right-price", "body"):
+        try:
+            loc = page.locator(sel).first
+            if await loc.count():
+                price = parse_price(await loc.inner_text(timeout=2000))
+                if price is not None:
+                    break
+        except Exception:
+            pass
+    return title[:120] or "(couldn't read the name)", price
+
+
+async def click_first(page: Page, selectors: list[str], timeout: float = 15000) -> bool:
+    """Waits for the first visible+enabled match among selectors and clicks it once."""
+    end = time.time() + timeout / 1000
+    while time.time() < end:
+        for sel in selectors:
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() and await loc.is_visible() and await loc.is_enabled():
+                    await loc.click()
+                    return True
+            except Exception:
+                pass
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def buy_flow(tag: str, page: Page, max_price: float | None) -> str:
+    """Add to cart -> cart -> checkout -> place order, on the winning window only.
+
+    Every step waits for what it expects and STOPS (returns a reason) if it doesn't
+    see it, leaving the window for you. Place Order is clicked at most once per run,
+    so a slow page can never turn into a double order. It never types card numbers
+    or security codes: if checkout asks for a CVV, it hands the window to you."""
+    if not await click_first(page, ["#add-to-cart-btn", "button:has-text('Add to Cart')"]):
+        return "couldn't click Add to Cart"
+    log(tag, "added to cart")
+    await asyncio.sleep(2)
+
+    await load(page, CART_URL)
+    if not await click_first(page, ["#shopCartCheckoutSubmitButton", "button:has-text('Checkout')",
+                                    "a:has-text('Checkout')", "input[value='Checkout']"], timeout=20000):
+        return "couldn't find Checkout on the cart page"
+    log(tag, "on checkout")
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+    except Exception:
+        pass
+    await asyncio.sleep(2)
+
+    # Security code / card entry = you do it.
+    for sel in ("input[name*='cvv' i]", "input[id*='cvv' i]", "input[name*='securityCode' i]", "input[autocomplete='cc-csc']"):
+        try:
+            if await page.locator(sel).first.is_visible():
+                return "checkout is asking for the card security code"
+        except Exception:
+            pass
+
+    if max_price is not None:
+        total = None
+        try:
+            body = await page.inner_text("body", timeout=5000)
+            idx = body.lower().rfind("total")  # order total is usually the last 'total' on the page
+            total = parse_price(body[idx:idx + 80]) if idx >= 0 else None
+        except Exception:
+            pass
+        if total is None:
+            return f"couldn't read the order total to check it against --max-price {max_price:.2f}"
+        if total > max_price:
+            return f"order total ${total:.2f} is over --max-price ${max_price:.2f}"
+        log(tag, f"order total ${total:.2f} is within --max-price")
+
+    global _ORDER_PLACED
+    if _ORDER_PLACED:
+        return "an order was already placed this run"
+    if not await click_first(page, ["#place-order-btn", "button:has-text('Place Order')",
+                                    "input[value='Place Order']"], timeout=20000):
+        return "couldn't find Place Order"
+    _ORDER_PLACED = True
+    log(tag, "clicked Place Order once. Check the window for the confirmation.")
+    return ""
+
+
+_ORDER_PLACED = False
+
+
+async def ask_yes_no(question: str) -> bool:
+    print(question, end="", flush=True)
+    ans = await asyncio.get_running_loop().run_in_executor(None, sys.stdin.readline)
+    return ans.strip().lower() in ("y", "yes")
+
+
+def prompt_target(args) -> None:
+    """If no --sku/--url was given, ask which item to watch."""
+    if args.url or args.sku_given:
+        return
+    try:
+        raw = input(f"SKU or product link to watch [{DEFAULT_SKU}]: ").strip()
+    except EOFError:
+        raw = ""
+    if raw.startswith("http"):
+        args.url = raw
+    elif raw:
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if not digits:
+            sys.exit(f"'{raw}' isn't a SKU number or a link")
+        args.sku = digits
+
+
 class Shared:
     def __init__(self) -> None:
         self.go_live = asyncio.Event()     # scout saw the page change
         self.found = asyncio.Event()       # someone reached BUYABLE
         self.winner: str | None = None
+        self.winner_page: Page | None = None
         self.alarm = Alarm()
         self.signin_lock = asyncio.Lock()  # one sign-in at a time, never a burst
         self.auto_failed = False           # one failed auto sign-in stops all further typing
@@ -352,12 +489,15 @@ async def run_profile(pw_api, chrome: str, idx: int, args, creds, shared: Shared
                 notify("Costco page is live", f"{args.url} changed to {state}", args.url)
 
             if state == BUYABLE:
+                if shared.found.is_set():
+                    return  # another window already won
                 shared.winner = tag
+                shared.winner_page = page
                 shared.found.set()
                 await page.bring_to_front()
                 shared.alarm.start()
                 notify("BUY NOW", f"{tag} can add to cart", args.url)
-                log(tag, ">>> BUYABLE. Window brought to front. Press Enter in this console to stop the alarm.")
+                log(tag, ">>> BUYABLE. Window brought to front.")
                 return
 
             if state == IN_QUEUE:
@@ -415,7 +555,7 @@ async def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--count", type=int, default=10, help="number of Chrome profiles (default 10; more = more ban risk)")
     ap.add_argument("--start", type=int, default=1, help="first profile number")
-    ap.add_argument("--sku", default=DEFAULT_SKU)
+    ap.add_argument("--sku", default=None, help=f"Costco item number (asks if omitted; Enter = {DEFAULT_SKU})")
     ap.add_argument("--url", default=None, help="full product URL (overrides --sku)")
     ap.add_argument("--interval", type=float, default=45, help="scout reload seconds (default 45, floor 20)")
     ap.add_argument("--stagger", type=float, default=15, help="seconds between launching profiles")
@@ -425,7 +565,13 @@ async def main() -> None:
     ap.add_argument("--ntfy", default=os.environ.get("NTFY_TOPIC"), help="ntfy.sh topic for phone pings")
     ap.add_argument("--skip-login", action="store_true")
     ap.add_argument("--close-on-exit", action="store_true")
+    ap.add_argument("--max-price", type=float, default=None, help="never place an order whose total is above this")
+    ap.add_argument("--no-buy-prompt", action="store_true", help="just alarm; never offer to buy")
     args = ap.parse_args()
+    args.sku_given = args.sku is not None
+    args.sku = args.sku or DEFAULT_SKU
+    if not args.setup:
+        prompt_target(args)
     args.url = args.url or PRODUCT_URL_TMPL.format(sku=args.sku)
     if args.interval < 20 and not os.environ.get("COSTCO_BOT_HEADLESS"):
         log("main", f"--interval {args.interval} is too aggressive, using 20")
@@ -449,12 +595,38 @@ async def main() -> None:
             return
 
         await shared.found.wait()
-        # Keep beeping until Enter.
-        await asyncio.get_running_loop().run_in_executor(None, input)
-        shared.alarm.stop()
-        log("main", f"alarm stopped. {shared.winner} was first. Windows stay open; Ctrl+C to quit.")
         for t in tasks:
-            t.cancel()
+            t.cancel()  # everyone else stops reloading; windows stay open
+        page = shared.winner_page
+
+        if args.no_buy_prompt:
+            await asyncio.get_running_loop().run_in_executor(None, sys.stdin.readline)
+            shared.alarm.stop()
+        else:
+            title, price = await product_summary(page)
+            price_s = f"${price:.2f}" if price is not None else "price unknown"
+            cap = f" (max ${args.max_price:.2f})" if args.max_price is not None else ""
+            print(f"\n  {shared.winner}: {title}\n  {price_s}{cap}")
+            yes = await ask_yes_no("  Buy 1 now? Bot will add to cart, check out and place the order. [y/N]: ")
+            shared.alarm.stop()
+            if yes and args.max_price is not None and price is not None and price > args.max_price:
+                log("main", f"item price ${price:.2f} is over --max-price, not buying. Window is yours.")
+                yes = False
+            if yes:
+                reason = await buy_flow(shared.winner, page, args.max_price)
+                if reason:
+                    log("main", f"STOPPED: {reason}. Finish in the {shared.winner} window.")
+                    await page.bring_to_front()
+                    shared.alarm.start()
+                    notify("Finish checkout by hand", reason, args.url)
+                    print("  Press Enter to stop the alarm.", flush=True)
+                    await asyncio.get_running_loop().run_in_executor(None, sys.stdin.readline)
+                    shared.alarm.stop()
+                else:
+                    notify("Order placed", f"{title} via {shared.winner}. Check your Costco orders.", None)
+            else:
+                log("main", "not buying. The window is yours.")
+        log("main", f"{shared.winner} was first. Windows stay open; Ctrl+C to quit.")
         while True:
             await asyncio.sleep(3600)
 
