@@ -1,6 +1,6 @@
 # BIGMANBLASTOISE
 
-A Costco drop helper for Windows. It opens several Chrome windows, signs each one into your Costco account, watches a product page until it goes live, and then sets off an alarm (plus an optional phone notification) as soon as one of the windows can add the item to its cart.
+A Costco drop helper for Windows. It opens several Chrome windows, signs each one into your Costco account, watches every product on your watch list (`skus.txt`), gets each window into the waiting room as soon as one goes live, and alerts you with a sound plus a phone notification **with a screenshot attached** when a window is in line or can add the item to its cart.
 
 **It only buys if you say yes.** When an item becomes buyable, the console shows its name and price and asks `Buy 1 now? [y/N]`. Type `y` and the bot adds it to the cart, checks out and places the order. Anything else (or just Enter) and the window is yours to finish by hand.
 
@@ -10,8 +10,8 @@ A Costco drop helper for Windows. It opens several Chrome windows, signs each on
 
 1. It opens N Chrome windows named **Costco 01**, **Costco 02**, and so on. Each window has its own profile folder in `profiles\01`, `profiles\02`, ..., so each one keeps its own sign-in and its own place in a queue.
 2. Each window signs in using `costco.env`, **one window at a time**, with a few seconds between sign-ins.
-3. **Costco 01 is the scout.** It's the only window that reloads the product page, roughly every 45 to 68 seconds. The other windows wait on the Costco home page.
-4. When the scout sees the page change (no longer the "Product Not Available" 404), **every window loads the product page at once**. If Costco puts up a waiting room, each window gets its own place in line, and the bot doesn't reload a window while it's in line.
+3. **Costco 01 is the scout.** It's the only window that reloads product pages. It goes through the SKUs on the watch list, one page load every 45 to 68 seconds. The other windows wait on the Costco home page.
+4. When the scout sees any watched page change (no longer a 404), **every window loads that product page at once**. If Costco puts up a waiting room, each window gets its own place in line, and the bot doesn't reload a window while it's in line.
 5. The first window with a clickable **Add to Cart** button jumps to the front, the bot beeps, and the console asks whether to buy (see [Buying](#buying)).
 
 ```
@@ -65,26 +65,49 @@ PASSWORD=YourCostcoPassword
 ### 5. First run (installs Playwright)
 Double-click **`run.bat`**. The first time, it installs the `playwright` Python package automatically (Playwright is only used to control the Chrome windows; it doesn't download another browser).
 
-### 6. Optional: phone notifications with ntfy
+### 6. Set your watch list (`skus.txt`)
+One Costco item number (or full product link) per line. Anything after `#` is a note:
+```
+2007501  # Pokemon 30th Celebration Day & Night UPC 2-pack bundle, $288.99
+2007497
+2007495  # 10-tin / 2-pack bundle, ~$76.49
+2007494  # 5-tin bundle, ~$38.99
+4201053980
+```
+
+### 7. Recommended: phone notifications with ntfy
 1. Install the **ntfy** app (iOS or Android, free, no account needed).
 2. In the app, subscribe to a topic with a long, hard-to-guess name, e.g. `bigdawg-costco-8f3k2`. Anyone who knows the topic name can read the notifications, so don't use something obvious.
 3. Run the bot with `--ntfy bigdawg-costco-8f3k2`, or set it once in Command Prompt with `setx NTFY_TOPIC bigdawg-costco-8f3k2` and open a new window.
 
-You'll get a push notification when the page goes live, when a window can add to cart, and when a window needs you to sign in.
+You'll get a push notification, with a screenshot of that window attached, when a page goes live, when the first window gets into the waiting room, when a window can add to cart, when a window needs you to sign in, when checkout stops for you, and when an order is placed. `check.bat` also pings you if any SKU is live.
 
 ---
 
 ## Usage
 
+### Checking the SKUs on demand
+Double-click **`check.bat`**. One window checks every SKU in `skus.txt` once, prints each status and link, saves a screenshot of each page to `screenshots\`, and closes:
+```
+  SKU check 2026-11-13 19:07:41
+  - not live yet (404)
+    https://www.costco.com/.product.2007501.html
+    screenshot: screenshots\20261113-190737_check_2007501_NOT_LIVE.png
+```
+Every normal `run.bat` does this same check first (skip it with `--no-check`).
+
 ### Recommended drop-day routine
 1. **The day before:** run `run.bat --setup`. It opens each window, signs it in, then exits. Sign-ins are saved in `profiles\`, so drop day starts already signed in.
-2. **Before the drop:** run `run.bat`. It asks `SKU or product link to watch [2007501]:`. Type a Costco item number, paste a product link, or press Enter to keep the default. Leave the console window open and the PC awake (turn off sleep).
+2. **Before the drop:** run `run.bat`. It shows the watch list and asks what to watch. Press Enter to watch all of them, type a list number to watch just that one, or type a new SKU or paste a link. Leave the console window open and the PC awake (turn off sleep).
 3. **When it beeps:** the winning window is now in front and the console asks `Buy 1 now? [y/N]`. Answering stops the beeping. All the windows stay open.
 4. **To quit:** press `Ctrl+C` in the console, then close the Chrome windows.
 
 ### Command examples
 ```
-run.bat                               10 windows, asks which SKU to watch
+run.bat                               10 windows, asks what to watch (Enter = whole watch list)
+run.bat --count 30                    30 windows
+check.bat                             check every SKU once, print status + links, exit
+run.bat --sku 2007495,2007494         watch just these two
 run.bat --count 5                     only 5 windows
 run.bat --sku 1234567                 watch a different Costco item number
 run.bat --url "https://www.costco.com/some-product.product.1234567.html"
@@ -101,7 +124,7 @@ You can also run it directly with `py costco_bot.py ...` and the same options.
 |---|---|---|
 | `--count` | 10 | Number of Chrome windows / profiles |
 | `--start` | 1 | First profile number (e.g. `--start 11 --count 5` uses profiles 11 to 15) |
-| `--sku` | asks | Costco item number to watch. If neither `--sku` nor `--url` is given, it asks (Enter = 2007501) |
+| `--sku` | asks | Costco item number(s), comma-separated. If neither `--sku` nor `--url` is given, it asks (Enter = everything in `skus.txt`) |
 | `--url` | | Full product URL; overrides `--sku` |
 | `--interval` | 45 | Seconds between the scout's reloads, plus random extra (minimum 20) |
 | `--stagger` | 15 | Seconds between opening each window |
@@ -113,6 +136,8 @@ You can also run it directly with `py costco_bot.py ...` and the same options.
 | `--close-on-exit` | off | Close Chrome windows if the bot exits without finding the item |
 | `--max-price` | none | Never place an order if the item price or the checkout total is above this |
 | `--no-buy-prompt` | off | Only sound the alarm; press Enter to stop it, then buy by hand |
+| `--check` | off | Check every SKU once, print status and links, exit (what `check.bat` runs) |
+| `--no-check` | off | Skip the SKU check at startup |
 
 ### What the console messages mean
 | Message | Meaning |
@@ -120,6 +145,8 @@ You can also run it directly with `py costco_bot.py ...` and the same options.
 | `state -> NOT_LIVE` | The product page is still a 404. Normal before a drop. |
 | `page changed, releasing all profiles` | The scout saw the page go live. All windows are loading it. |
 | `state -> IN_QUEUE` | That window is in Costco's waiting room. It waits without reloading. |
+| `entered the waiting room (5/30 windows in line)` | Running count of windows in line. Your phone gets one ping, for the first one. |
+| `screenshot: <file>.png` | Saved to `screenshots\`. |
 | `state -> OUT_OF_STOCK` | The page is live but you can't add it to cart yet. Keeps checking. |
 | `>>> BUYABLE` | That window can add to cart and is in front. Answer the `Buy 1 now?` question. |
 | `added to cart` / `on checkout` | You said yes; the bot is working through checkout. |
@@ -182,6 +209,12 @@ Running several sessions at once may still break Costco's terms of service. Fewe
 
 ---
 
+## Screenshots
+
+Saved to `screenshots\` as `<date>-<time>_<window>_<event>.png`, where the event is `LIVE`, `QUEUE`, `BUYABLE`, `BLOCKED`, `SIGNIN`, `STOPPED`, `ORDER`, or `check_<sku>_<state>`. They're also attached to the phone notifications. To have Claude review them, ask it to "check my costco screenshots"; it can open the folder and tell you if anything looks wrong.
+
+---
+
 ## Customizing the alarm trigger
 
 `classify_page()` in `costco_bot.py` decides when to sound the alarm. By default it fires only when an **Add to Cart** button is visible and clickable (`#add-to-cart-btn` or a button whose text is "Add to Cart"). If Costco changes its page, update the button selector there. To get an earlier warning, you could also fire on `OUT_OF_STOCK` (the page is live but not buyable yet).
@@ -220,6 +253,9 @@ py costco_bot.py --setup --count 2 --stagger 1
 | `run.bat` | Installs Playwright if needed, then runs the bot with whatever options you pass |
 | `costco.env` | **Your credentials. Not in git.** You create it. |
 | `profiles\` | Chrome profile per window (sign-ins live here). **Not in git.** |
+| `skus.txt` | Watch list |
+| `check.bat` | Checks the watch list once |
+| `screenshots\` | Screenshots at each key moment. **Not in git.** |
 | `tests\` | Fake Costco servers and the buy-scenario test script |
 | `docs\TECHNICAL.md` | Design, decisions, history and current state, for anyone (or any AI) picking this up later |
 | `LESSONS.md` | Mistakes made while building this and how they were fixed |

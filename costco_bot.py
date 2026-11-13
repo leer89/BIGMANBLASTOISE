@@ -37,6 +37,8 @@ from playwright.async_api import async_playwright, Page
 HERE = Path(__file__).resolve().parent
 PROFILES_DIR = HERE / "profiles"
 ENV_FILE = HERE / "costco.env"
+SHOTS_DIR = HERE / "screenshots"
+NTFY_BASE = os.environ.get("COSTCO_BOT_NTFY_URL", "https://ntfy.sh")  # env override is for the test harness
 
 DEFAULT_SKU = "2007501"
 PRODUCT_URL_TMPL = "https://www.costco.com/.product.{sku}.html"
@@ -127,18 +129,41 @@ def chime() -> None:
         print("\a", end="", flush=True)
 
 
-def push(topic: str | None, title: str, body: str, url: str | None = None) -> None:
+def _ascii(s: str) -> str:
+    return s.encode("ascii", "replace").decode()  # HTTP headers must be plain ASCII
+
+
+def push(topic: str | None, title: str, body: str, url: str | None = None, attach: Path | None = None) -> None:
+    """Phone notification via ntfy. With attach, the screenshot is sent as the
+    notification's attachment (shows as an image on the phone)."""
     if not topic:
         return
     try:
-        req = urllib.request.Request(
-            f"https://ntfy.sh/{topic}", data=body.encode(), method="POST",
-            headers={"Title": title, "Priority": "urgent", "Tags": "rotating_light",
-                     **({"Click": url} if url else {})},
-        )
-        urllib.request.urlopen(req, timeout=10).read()
+        headers = {"Title": _ascii(title), "Priority": "urgent", "Tags": "rotating_light"}
+        if url:
+            headers["Click"] = url
+        if attach and attach.exists():
+            headers.update({"Filename": attach.name, "Message": _ascii(body).replace("\n", " ")})
+            req = urllib.request.Request(f"{NTFY_BASE}/{topic}", data=attach.read_bytes(), method="PUT", headers=headers)
+        else:
+            req = urllib.request.Request(f"{NTFY_BASE}/{topic}", data=body.encode(), method="POST", headers=headers)
+        opener = _NO_PROXY if NTFY_BASE.startswith("http://127.0.0.1") else urllib.request.build_opener()
+        opener.open(req, timeout=30).read()
     except Exception as e:  # never let a notification failure kill the bot
         log("ntfy", f"push failed: {e}")
+
+
+async def snap(page: Page, tag: str, label: str) -> Path | None:
+    """Saves screenshots/<time>_<tag>_<label>.png. Returns None if it can't."""
+    try:
+        SHOTS_DIR.mkdir(exist_ok=True)
+        path = SHOTS_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}_{tag}_{label}.png"
+        await page.screenshot(path=str(path), timeout=10000)
+        log(tag, f"screenshot: {path.name}")
+        return path
+    except Exception as e:
+        log(tag, f"screenshot failed: {e.__class__.__name__}")
+        return None
 
 
 # --------------------------------------------------------------------------- page logic
@@ -258,7 +283,7 @@ async def manual_sign_in(tag: str, page: Page, notify, timeout: float = 600) -> 
     log(tag, "waiting for you to finish signing in in this window")
     await page.bring_to_front()
     chime()
-    notify(f"{tag} needs sign-in", "Finish signing in in that Chrome window.")
+    notify(f"{tag} needs sign-in", "Finish signing in in that Chrome window.", None, await snap(page, tag, "SIGNIN"))
     ok = await wait_until_signed_in(tag, page, timeout)
     log(tag, "signed in" if ok else "sign-in not completed, continuing signed out")
     return ok
@@ -418,21 +443,103 @@ async def ask_yes_no(question: str) -> bool:
     return ans.strip().lower() in ("y", "yes")
 
 
+WATCHLIST_FILE = HERE / "skus.txt"
+
+
+def sku_url(sku_or_url: str) -> str:
+    return sku_or_url if sku_or_url.startswith("http") else PRODUCT_URL_TMPL.format(sku=sku_or_url)
+
+
+def load_watchlist(path: Path = WATCHLIST_FILE) -> list[tuple[str, str]]:
+    """skus.txt: one SKU (or product link) per line, optional '# note'. Blank lines and
+    lines starting with # are ignored."""
+    items = []
+    if not path.exists():
+        return [(DEFAULT_SKU, "")]
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        val, _, note = line.partition("#")
+        val = val.strip()
+        if not val.startswith("http"):
+            val = "".join(ch for ch in val if ch.isdigit())
+        if val:
+            items.append((val, note.strip()))
+    return items or [(DEFAULT_SKU, "")]
+
+
 def prompt_target(args) -> None:
-    """If no --sku/--url was given, ask which item to watch."""
-    if args.url or args.sku_given:
+    """Sets args.urls. --sku/--url win; otherwise ask, defaulting to the whole watch list."""
+    if args.url:
+        args.urls = [args.url]
         return
+    if args.sku_given:
+        args.urls = [sku_url(s.strip()) for s in args.sku.split(",") if s.strip()]
+        return
+    wl = load_watchlist()
+    print("Watch list (skus.txt):")
+    for i, (val, note) in enumerate(wl, 1):
+        print(f"  {i}. {val}{'  # ' + note if note else ''}")
     try:
-        raw = input(f"SKU or product link to watch [{DEFAULT_SKU}]: ").strip()
+        raw = input("Enter = watch all, a list number, or a new SKU / link: ").strip()
     except EOFError:
         raw = ""
-    if raw.startswith("http"):
-        args.url = raw
-    elif raw:
+    if not raw:
+        args.urls = [sku_url(v) for v, _ in wl]
+    elif raw.startswith("http"):
+        args.urls = [raw]
+    elif raw.isdigit() and 1 <= int(raw) <= len(wl):
+        args.urls = [sku_url(wl[int(raw) - 1][0])]
+    else:
         digits = "".join(ch for ch in raw if ch.isdigit())
         if not digits:
-            sys.exit(f"'{raw}' isn't a SKU number or a link")
-        args.sku = digits
+            sys.exit(f"'{raw}' isn't a list number, SKU or link")
+        args.urls = [sku_url(digits)]
+
+
+async def check_skus(pw_api, chrome: str, idx: int, urls: list[str]) -> list[dict]:
+    """One pass over every URL with a single window: status, name, price, link.
+    Spaced 3 to 6 s apart so it's a handful of normal page views."""
+    proc = launch_chrome(chrome, idx, f"Costco {idx:02d} (check)")
+    rows = []
+    try:
+        await wait_for_port(BASE_PORT + idx)
+        browser = await pw_api.chromium.connect_over_cdp(f"http://127.0.0.1:{BASE_PORT + idx}")
+        ctx = browser.contexts[0]
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        for i, url in enumerate(urls):
+            if i:
+                await asyncio.sleep(random.uniform(3, 6))
+            status = await load(page, url)
+            state = await classify_page(page, status)
+            title, price = ("", None)
+            if state not in (NOT_LIVE, BLOCKED, NEEDS_LOGIN):
+                title, price = await product_summary(page)
+            name = url.rsplit(".product.", 1)[-1].removesuffix(".html") if ".product." in url else f"url{i + 1}"
+            shot = await snap(page, "check", "".join(c for c in name if c.isalnum()) + "_" + state)
+            rows.append({"url": url, "state": state, "title": title, "price": price, "shot": shot})
+        await browser.close()
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+    return rows
+
+
+def print_check(rows: list[dict]) -> None:
+    labels = {NOT_LIVE: "not live yet (404)", OUT_OF_STOCK: "LIVE, out of stock", IN_QUEUE: "LIVE, waiting room",
+              BUYABLE: "LIVE, BUYABLE", BLOCKED: "blocked by Costco", NEEDS_LOGIN: "needs sign-in", UNKNOWN: "page up, unclear"}
+    print(f"\n  SKU check {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    for r in rows:
+        extra = " | ".join(x for x in (r["title"], f"${r['price']:.2f}" if r["price"] is not None else "") if x)
+        print(f"  - {labels.get(r['state'], r['state'])}{'  ' + extra if extra else ''}\n    {r['url']}")
+        if r.get("shot"):
+            print(f"    screenshot: screenshots\\{r['shot'].name}")
+    print()
 
 
 class Shared:
@@ -441,6 +548,8 @@ class Shared:
         self.found = asyncio.Event()       # someone reached BUYABLE
         self.winner: str | None = None
         self.winner_page: Page | None = None
+        self.live_url: str | None = None   # which watched URL went live first
+        self.in_queue: set[str] = set()      # profiles that have entered a waiting room
         self.alarm = Alarm()
         self.signin_lock = asyncio.Lock()  # one sign-in at a time, never a burst
         self.auto_failed = False           # one failed auto sign-in stops all further typing
@@ -475,18 +584,27 @@ async def run_profile(pw_api, chrome: str, idx: int, args, creds, shared: Shared
             await shared.go_live.wait()
             await asyncio.sleep(random.uniform(0, 1.5))  # don't all hit at the same ms
 
-        last = None
+        last: dict[str, str] = {}  # url -> last logged state, so logs only show changes
+        cursor = 0
         while not shared.found.is_set():
-            status = await load(page, args.url)
+            # Before go-live the scout rotates through every watched URL, one request per
+            # interval. After go-live everyone works the URL that went live.
+            if shared.go_live.is_set():
+                url = shared.live_url
+            else:
+                url = args.urls[cursor % len(args.urls)]
+                cursor += 1
+            status = await load(page, url)
             state = await classify_page(page, status)
-            if state != last:
-                log(tag, f"state -> {state}")
-                last = state
+            if last.get(url) != state:
+                log(tag, f"state -> {state}" + (f"  [{url.rsplit('.product.', 1)[-1].removesuffix('.html')}]" if len(args.urls) > 1 else ""))
+                last[url] = state
 
             if is_scout and state != NOT_LIVE and not shared.go_live.is_set():
-                log(tag, "page changed, releasing all profiles")
+                log(tag, f"page changed: {url}. Releasing all profiles")
+                shared.live_url = url
                 shared.go_live.set()
-                notify("Costco page is live", f"{args.url} changed to {state}", args.url)
+                notify("Costco page is live", f"{url} changed to {state}", url, await snap(page, tag, "LIVE"))
 
             if state == BUYABLE:
                 if shared.found.is_set():
@@ -496,12 +614,19 @@ async def run_profile(pw_api, chrome: str, idx: int, args, creds, shared: Shared
                 shared.found.set()
                 await page.bring_to_front()
                 shared.alarm.start()
-                notify("BUY NOW", f"{tag} can add to cart", args.url)
+                notify("BUY NOW", f"{tag} can add to cart", url, await snap(page, tag, "BUYABLE"))
                 log(tag, ">>> BUYABLE. Window brought to front.")
                 return
 
             if state == IN_QUEUE:
                 chime()
+                if tag not in shared.in_queue:
+                    shared.in_queue.add(tag)
+                    shot = await snap(page, tag, "QUEUE")
+                    n = len(shared.in_queue)
+                    log(tag, f"entered the waiting room ({n}/{args.count} windows in line)")
+                    if n == 1:  # one push for the first window in line, not 30
+                        notify("In the Costco queue", f"{tag} is in the waiting room for {url}", url, shot)
                 # Don't reload a waiting room (can lose your spot). Watch URL until it moves on.
                 while not shared.found.is_set():
                     await asyncio.sleep(3)
@@ -522,7 +647,7 @@ async def run_profile(pw_api, chrome: str, idx: int, args, creds, shared: Shared
                 else:
                     log(tag, "signed out again. Not retrying automatically; sign in by hand in this window.")
                     chime()
-                    notify(f"{tag} signed out", "Sign in by hand in that window.", args.url)
+                    notify(f"{tag} signed out", "Sign in by hand in that window.", url)
                     await wait_until_signed_in(tag, page, 600)
                 continue
 
@@ -533,8 +658,9 @@ async def run_profile(pw_api, chrome: str, idx: int, args, creds, shared: Shared
                 wait = min(120 * 2 ** (blocked_strikes - 1), 1800)
                 log(tag, f"blocked by Costco (strike {blocked_strikes}), pausing {wait // 60} min")
                 chime()
+                shot = await snap(page, tag, "BLOCKED")
                 if is_scout:
-                    notify("Costco is blocking the scout", f"Pausing {wait // 60} min. Consider fewer windows / longer --interval.")
+                    notify("Costco is blocking the scout", f"Pausing {wait // 60} min. Consider fewer windows / longer --interval.", None, shot)
                 await asyncio.sleep(wait)
                 continue
             blocked_strikes = 0
@@ -555,7 +681,7 @@ async def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--count", type=int, default=10, help="number of Chrome profiles (default 10; more = more ban risk)")
     ap.add_argument("--start", type=int, default=1, help="first profile number")
-    ap.add_argument("--sku", default=None, help=f"Costco item number (asks if omitted; Enter = {DEFAULT_SKU})")
+    ap.add_argument("--sku", default=None, help="Costco item number(s), comma-separated (asks if omitted; Enter = all in skus.txt)")
     ap.add_argument("--url", default=None, help="full product URL (overrides --sku)")
     ap.add_argument("--interval", type=float, default=45, help="scout reload seconds (default 45, floor 20)")
     ap.add_argument("--stagger", type=float, default=15, help="seconds between launching profiles")
@@ -567,12 +693,25 @@ async def main() -> None:
     ap.add_argument("--close-on-exit", action="store_true")
     ap.add_argument("--max-price", type=float, default=None, help="never place an order whose total is above this")
     ap.add_argument("--no-buy-prompt", action="store_true", help="just alarm; never offer to buy")
+    ap.add_argument("--check", action="store_true", help="check every SKU in skus.txt once, print status + links, exit")
+    ap.add_argument("--no-check", action="store_true", help="skip the SKU check at startup")
     args = ap.parse_args()
     args.sku_given = args.sku is not None
-    args.sku = args.sku or DEFAULT_SKU
-    if not args.setup:
+    if args.check:
+        urls = [args.url] if args.url else ([sku_url(s.strip()) for s in args.sku.split(",") if s.strip()]
+                                             if args.sku_given else [sku_url(v) for v, _ in load_watchlist()])
+        async with async_playwright() as p:
+            rows = await check_skus(p, find_chrome(args.chrome), args.start, urls)
+        print_check(rows)
+        for r in rows:
+            if r["state"] not in (NOT_LIVE, BLOCKED, NEEDS_LOGIN):
+                push(args.ntfy, "Costco SKU is live", f"{r['state']}: {r['title'] or r['url']}", r["url"], r["shot"])
+        return
+    if args.setup:
+        args.urls = [sku_url(DEFAULT_SKU)]
+    else:
         prompt_target(args)
-    args.url = args.url or PRODUCT_URL_TMPL.format(sku=args.sku)
+    args.url = args.urls[0]
     if args.interval < 20 and not os.environ.get("COSTCO_BOT_HEADLESS"):
         log("main", f"--interval {args.interval} is too aggressive, using 20")
         args.interval = 20
@@ -580,10 +719,15 @@ async def main() -> None:
     creds = (None, None) if (args.manual_login or args.skip_login) else load_creds(ENV_FILE)
     chrome = find_chrome(args.chrome)
     shared = Shared()
-    notify = lambda title, body, url=None: push(args.ntfy, title, body, url)
+    def notify(title, body, url=None, attach=None):  # background thread: never stalls the bot
+        threading.Thread(target=push, args=(args.ntfy, title, body, url, attach), daemon=True).start()
 
-    log("main", f"{args.count} profiles, watching {args.url}")
+    log("main", f"{args.count} profiles, watching: " + ", ".join(args.urls))
     async with async_playwright() as p:
+        if not args.setup and not args.no_check:
+            rows = await check_skus(p, chrome, args.start, args.urls)
+            print_check(rows)
+            await asyncio.sleep(3)  # let the check window's profile unlock before relaunching it
         tasks = []
         for i in range(args.start, args.start + args.count):
             tasks.append(asyncio.create_task(run_profile(p, chrome, i, args, creds, shared, notify)))
@@ -618,12 +762,14 @@ async def main() -> None:
                     log("main", f"STOPPED: {reason}. Finish in the {shared.winner} window.")
                     await page.bring_to_front()
                     shared.alarm.start()
-                    notify("Finish checkout by hand", reason, args.url)
+                    notify("Finish checkout by hand", reason, page.url, await snap(page, shared.winner, "STOPPED"))
                     print("  Press Enter to stop the alarm.", flush=True)
                     await asyncio.get_running_loop().run_in_executor(None, sys.stdin.readline)
                     shared.alarm.stop()
                 else:
-                    notify("Order placed", f"{title} via {shared.winner}. Check your Costco orders.", None)
+                    await asyncio.sleep(3)
+                    notify("Order placed", f"{title} via {shared.winner}. Check your Costco orders.", None,
+                           await snap(page, shared.winner, "ORDER"))
             else:
                 log("main", "not buying. The window is yours.")
         log("main", f"{shared.winner} was first. Windows stay open; Ctrl+C to quit.")

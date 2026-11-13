@@ -2,3 +2,4 @@ costco.env
 *.env
 profiles/
 __pycache__/
+screenshots/

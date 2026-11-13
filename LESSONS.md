@@ -13,3 +13,6 @@ Check this before each change. Add every mistake and its fix.
 - 2026-11-13: Commit author email was set to the owner's personal Gmail; the repo is public. Fix: rewrote all commits to leer89@users.noreply.github.com before the first push and set that as the repo's user.email.
 - 2026-11-13: Buy flow can't be tested on the real Costco checkout without placing a real order. Fix: every checkout step waits for an expected element and stops (hands the window to the owner) if it's missing; CVV prompt = stop; --max-price checks item price and checkout total; Place Order clicked at most once per run (_ORDER_PLACED). Tested 6 scenarios on tests/mock_costco.py.
 - 2026-11-13: The module docstring still said "never checks out" after the buy feature was added. Fix: update docstrings and README together with behavior changes.
+- 2026-11-13: Costco has two different 404 pages ("Product Not Available" via /p/-/404 and "Oops! Something went wrong"). Fix: classify on HTTP status first, so wording changes don't matter.
+- 2026-11-13: Scout rotating over several SKUs logged a line on every check. Fix: track the last logged state per URL and log only changes.
+- 2026-11-13: urllib push in the async loop could stall every window for up to the timeout. Fix: notify() pushes on a daemon thread.

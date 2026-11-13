@@ -2,13 +2,13 @@
 
 Design, decisions, history and current state of the Costco drop bot. Written so that a person or an AI assistant picking this up later has the full context without the original conversation. Check `LESSONS.md` before changing anything; it lists the mistakes already made and how each was fixed.
 
-Last updated: 2026-11-13.
+Last updated: 2026-11-13 (commit 5).
 
 ---
 
 ## 1. Goal
 
-Owner: leer89 (GitHub). Target drop: **Costco SKU 2007501**.
+Owner: leer89 (GitHub). Target drops: the SKUs in `skus.txt` (2007501, 2007497, 2007495, 2007494, 4201053980).
 
 The requirements, in the order the owner gave them:
 1. Open Chrome, create many profiles (originally "up to 30", named with sequential numbers), sign each into Costco using a credential file, go to the product link, and get in the queue.
@@ -19,17 +19,27 @@ The requirements, in the order the owner gave them:
 6. Setup and usage documentation.
 7. A way to enter the SKU to watch, and to **ask permission before buying**, then buy if the owner says yes.
 8. This document.
+9. Links and status for each SKU, more SKUs on the watch list (2007497, 2007495, 2007494, 4201053980).
+10. Check the SKUs on demand, and automatically whenever the bot runs.
+11. Notify the owner directly when a window gets into the queue, take screenshots, and have Claude review them. Email the owner with questions (not possible in this session: no email connector. The owner was told to connect Gmail if he wants that; ntfy push with screenshots is used instead).
 
 Owner's standing working preferences (apply to future work): commit to git often; test before asking for review; keep `LESSONS.md` updated with every mistake and fix and check it before each step; spell out any manual steps for the owner, in order; when a third-party account or service is needed, stop and tell the owner rather than building workarounds; no em dashes in writing.
 
 ---
 
-## 2. State of SKU 2007501 (2026-11-13)
+## 2. State of the watched SKUs (2026-11-13, checked in a real desktop browser)
 
-- `https://www.costco.com/.product.2007501.html` redirects to `https://www.costco.com/p/-/404` ("Product Not Available").
-- A Costco site search for `2007501` returns no results.
-- Conclusion: the item isn't published yet. The bot treats the 404 as `NOT_LIVE` and keeps polling.
-- Fetching costco.com from a cloud server failed (Akamai blocks it); the check above was done in a real desktop browser.
+| SKU | Note (from owner) | Result |
+|---|---|---|
+| 2007501 | Pokemon 30th Celebration Day & Night UPC 2-pack bundle, $288.99 | HTTP 404. Redirected to `/p/-/404` ("Product Not Available") earlier in the day, later to `/p/-/2007501` |
+| 2007497 | | HTTP 404, "Oops! Something went wrong" |
+| 2007495 | 10-tin / 2-pack bundle, ~$76.49 | HTTP 404, "Oops! Something went wrong" |
+| 2007494 | 5-tin bundle, ~$38.99 | HTTP 404, "Oops! Something went wrong" |
+| 4201053980 | from a link the owner gave | HTTP 404, "Oops! Something went wrong" |
+
+- Costco shows two different 404 pages. Both return HTTP 404, which `classify_page` checks first, so both count as `NOT_LIVE`.
+- A Costco site search for `2007501` returns no results. None of the items are published yet.
+- Fetching costco.com from a cloud server fails (Akamai blocks it).
 
 ---
 
@@ -50,7 +60,8 @@ Python waits for `http://127.0.0.1:<port>/json/version` (through a proxy-less ur
 **Real Chrome over CDP instead of `playwright.chromium.launch()`:** it runs the installed Chrome binary with normal user-data directories, and the sign-ins persist between runs in `profiles\NN`.
 
 ### 3.2 Roles: scout and followers
-- **Scout** = the first profile (`--start`, default 1). It's the only window that polls the product URL before the drop: `--interval` (default 45 s, floor 20 s outside the test harness) plus up to 50% random jitter.
+- **Scout** = the first profile (`--start`, default 1). It's the only window that polls before the drop. It rotates through `args.urls` (the watch list), **one page load per interval**: `--interval` (default 45 s, floor 20 s outside the test harness) plus up to 50% random jitter. With 5 SKUs, each SKU is therefore checked about every 4 to 6 minutes. Keeping the request rate per interval constant, rather than per SKU, means a longer watch list doesn't make the scout more aggressive.
+- When a watched URL classifies as anything other than `NOT_LIVE`, the scout stores it in `shared.live_url` and sets `go_live`. From then on, **every window (scout included) works that one URL**. Other watched SKUs are no longer polled during that run.
 - **Followers** sign in, park on the Costco home page, and wait on `shared.go_live` (an `asyncio.Event`).
 - When the scout classifies the page as anything other than `NOT_LIVE`, it sets `go_live`. Followers start loading the product URL (0 to 1.5 s random offset), then poll at 2 x interval.
 - Reason: 30 windows reloading a 404 would be the most bot-like traffic possible, and pre-drop polling only needs one observer.
@@ -102,13 +113,24 @@ Runs in `main()` after `shared.found` is set, on `shared.winner_page` only; all 
 - **Not verified against the real Costco checkout**, which can't be exercised without placing a real order. All checkout selectors are best guesses that fail safe (stop and hand over).
 - `--no-buy-prompt` restores the original behavior: alarm only, Enter stops it.
 
-### 3.7 SKU selection (`prompt_target`)
-If neither `--sku` nor `--url` is given (and it isn't `--setup`), the bot asks `SKU or product link to watch [2007501]:`. Enter keeps the default, an `http...` answer is used as the URL, otherwise the digits are extracted (`"item 1234567"` gives `1234567`), and text with no digits exits with an error.
+### 3.7 Watch list and SKU selection (`skus.txt`, `load_watchlist`, `prompt_target`)
+- `skus.txt`: one SKU or product link per line; `#` starts a note; blank lines and `#` lines are skipped; non-digits are stripped from SKUs. A missing or empty file falls back to 2007501.
+- `prompt_target` sets `args.urls`. `--url` wins, then `--sku` (comma-separated). Otherwise it prints the numbered watch list and asks: Enter = all, a list number = that one, an `http...` answer = that link, other text = the digits in it (text with no digits exits with an error).
+
+### 3.7b SKU check (`check_skus`, `print_check`, `--check`, `check.bat`)
+- Launches one window (profile `--start`, labelled "(check)"), loads each URL 3 to 6 s apart, classifies it, reads the name and price if the page is up, and saves a screenshot `check_<sku>_<state>.png`. Then it closes that Chrome.
+- `--check` / `check.bat`: prints the table and exits, pushing to ntfy for any SKU that is live.
+- A normal run does the same check first (skip it with `--no-check`), waits 3 s for the profile lock to release, then launches the full set of windows.
+
+### 3.7c Screenshots (`snap`)
+`screenshots/<YYYYMMDD-HHMMSS>_<tag>_<event>.png` (gitignored). Events: `LIVE` (scout, at go-live), `QUEUE` (each window's first entry into a waiting room), `BUYABLE`, `BLOCKED`, `SIGNIN` (manual sign-in needed), `STOPPED` (checkout safety stop), `ORDER` (3 s after Place Order), `check_*`. Failures are logged and ignored. Claude can review them on request: stage the files from `Desktop\costco\screenshots` and view them.
 
 ### 3.8 Alerts
 - `Alarm`: a background thread looping `winsound.Beep` 1200/1600/2000 Hz (terminal bell on non-Windows) until `stop()`.
 - `chime()`: a single 880 Hz beep for non-urgent prompts (queue entered, sign-in needed).
-- `push()`: POST to `https://ntfy.sh/<topic>` with `Priority: urgent`. Failures are logged and never raised. The topic comes from `--ntfy` or `NTFY_TOPIC`. ntfy needs no account; the owner installs the app and picks a hard-to-guess topic name.
+- `push()`: to `https://ntfy.sh/<topic>` with `Priority: urgent`. With a screenshot it's a PUT with the PNG as the body and `Filename` / `Message` headers (ntfy shows it as an image attachment); without one it's a plain POST. Header text is forced to ASCII. Failures are logged and never raised. The topic comes from `--ntfy` or `NTFY_TOPIC`. ntfy needs no account; the owner installs the app and picks a hard-to-guess topic name.
+- `notify()` (defined in `main`) runs `push` on a daemon thread so an upload never stalls the event loop.
+- Queue pings: `shared.in_queue` counts windows that have entered a waiting room. Only the first window in line sends a push (30 pings would be noise); every entry is logged as `N/count windows in line`.
 
 ### 3.9 Configuration overrides (test harness only)
 | Env var | Effect |
@@ -117,6 +139,7 @@ If neither `--sku` nor `--url` is given (and it isn't `--setup`), the bot asks `
 | `COSTCO_BOT_LOGIN_URL` | replaces `LOGIN_URL` |
 | `COSTCO_BOT_HOST` | replaces `SITE_HOST` (the "signed in" host check) |
 | `COSTCO_BOT_CART_URL` | replaces `CART_URL` |
+| `COSTCO_BOT_NTFY_URL` | replaces the ntfy base URL (the mock serves `/ntfy`) |
 
 ---
 
@@ -141,13 +164,15 @@ Remaining risk: several simultaneous sessions on one account, plus automated sig
 |---|---|
 | `costco_bot.py` | the bot |
 | `run.bat` | checks for `py`, `pip install --upgrade playwright`, runs the bot with `%*`, pauses. CRLF line endings. |
+| `check.bat` | same, but runs `--check` |
+| `skus.txt` | watch list |
 | `README.md` | owner-facing setup and usage |
 | `LESSONS.md` | mistakes and fixes, append-only |
 | `docs/TECHNICAL.md` | this file |
-| `tests/mock_costco.py` | fake store on :8765: product (404 x3, waiting room once, then buyable with name and price), `/add`, `/cart`, `/checkout` (optional CVV via `MOCK_CVV=1`; price and total via `MOCK_PRICE` / `MOCK_TOTAL`), `/confirm` (counts orders) |
+| `tests/mock_costco.py` | fake store on :8765: product (404 x3, waiting room once, then buyable with name and price), `/never` (always 404), `/add`, `/cart`, `/checkout` (optional CVV via `MOCK_CVV=1`; price and total via `MOCK_PRICE` / `MOCK_TOTAL`), `/confirm` (counts orders), `/ntfy/<topic>` (fake ntfy, logs title, filename and size) |
 | `tests/mock_login.py` | fake B2C sign-in on :8766: correct creds `me@x.com` / `P=a$ss` redirect to `/home`, wrong ones back to the form; counts submits |
 | `tests/run_buy_tests.sh` | runs 6 buy scenarios and checks the order count |
-| `.gitignore` | `costco.env`, `*.env`, `profiles/`, `__pycache__/` |
+| `.gitignore` | `costco.env`, `*.env`, `profiles/`, `__pycache__/`, `screenshots/` |
 
 Local working copy: `C:\Users\JOOPY\Desktop\costco` (the owner's PC; holds `costco.env` and `profiles\`). Remote: `https://github.com/leer89/BIGMANBLASTOISE` (public), branch `main`.
 
@@ -175,7 +200,11 @@ All runs used real Google Chrome (headless) in a Linux container, against the mo
 | Buy: `--max-price 90` | 1 order |
 | Buy: `--max-price 50`, item $79.99 | 0 orders (refused before add to cart) |
 | Buy: checkout asks for CVV | 0 orders, STOPPED |
-| `prompt_target`: Enter, digits, "item 1234567", URL, "abc", EOF, `--sku` given | all as expected |
+| `prompt_target` with the watch list: Enter (all), list numbers, new SKU, URL, "abc", EOF, `--sku a,b`, `--url` | all as expected |
+| `--check` with 2 URLs: table and screenshots, exits | pass |
+| Full run, 2 watched URLs: startup check, scout rotates, the live one wins, followers switch to it, buy `y` | 1 order |
+| Screenshots + ntfy: LIVE, QUEUE and ORDER pushes each arrive at the fake ntfy as a PUT with the PNG attached; the QUEUE screenshot was viewed and showed the waiting room page | pass |
+| 6 buy scenarios re-run after the watch-list and screenshot changes | 6/6 |
 
 **Not tested** (needs the real site or the owner's PC): real Costco sign-in selectors, real product page selectors, real queue URL shape, real cart and checkout selectors, `winsound` on Windows, Chrome launching under the owner's work-managed device policy (the screenshot showed "Your device is managed by your organization", which may block remote debugging).
 
@@ -191,6 +220,8 @@ All runs used real Google Chrome (headless) in a Linux container, against the mo
 6. Owner rejected manual sign-in: auto sign-in became the default with one attempt per profile, `auto_failed` short-circuit, and the manual fallback moved outside the lock. Added `tests/mock_login.py`. Commit 3.
 7. Owner gave the public repo URL: verified there are no credentials anywhere in history, rewrote author emails to noreply, imported history into a clone of the (empty) GitHub repo via a git bundle.
 8. Owner asked for docs, SKU entry, and buy-with-permission: full README, `prompt_target`, `buy_flow` with safety stops, `--max-price`, `--no-buy-prompt`, extended `mock_costco.py`, `run_buy_tests.sh` (6/6 pass), this document. Commit 4, pushed.
+9. Owner added SKUs 2007497, 2007495, 2007494, 4201053980 and asked for on-demand and automatic checks: `skus.txt`, `check.bat` / `--check`, startup check, scout rotation over the watch list.
+10. Owner asked Claude to open 30 profiles itself, notify him when in the queue, take and review screenshots, and email him with questions. Explained the limits: Claude doesn't enter passwords on sites, doesn't stay running between messages, and has no email connector here. Built the equivalent into the bot: screenshots at each key moment, ntfy pushes with screenshots, a one-time "first window in line" ping, and Claude reviews screenshots when asked. Commit 5, pushed.
 
 ---
 
@@ -201,3 +232,6 @@ All runs used real Google Chrome (headless) in a Linux container, against the mo
 - Owner decision pending: whether the alarm should also fire earlier (e.g. on `OUT_OF_STOCK`, meaning the page is live but not buyable).
 - Owner should make sure a default shipping address and payment method are saved on the Costco account; otherwise checkout will stop for manual input.
 - Consider changing the Costco password (see Timeline step 3).
+- If the owner wants email: connect Gmail to Claude, then Claude can draft messages.
+- Owner hasn't set up ntfy yet. Without `--ntfy` there are no phone pings; screenshots are still saved.
+- After a drop: ask Claude to review `screenshots\` (stage the files and view them) to confirm the queue and checkout pages matched expectations, then tune selectors.

@@ -1,0 +1,6 @@
+# Costco SKUs to watch. One per line; anything after # is a note.
+2007501  # Pokemon 30th Celebration Day & Night UPC 2-pack bundle, $288.99
+2007497
+2007495  # 10-tin / 2-pack bundle, ~$76.49
+2007494  # 5-tin bundle, ~$38.99
+4201053980
