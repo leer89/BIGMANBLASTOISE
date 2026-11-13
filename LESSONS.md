@@ -7,3 +7,5 @@ Check this before each change. Add every mistake and its fix.
 - 2026-11-13: SKU 2007501 returned Costco's 404 "Product Not Available" page on 11/13, and site search had no hit. The bot treats 404 as NOT_LIVE and keeps polling instead of erroring.
 - 2026-11-13: Polling 30 windows at once invites Akamai blocks. Fix: scout pattern (only profile 01 polls, the rest wait for the go-live signal).
 - 2026-11-13: urllib honors HTTPS_PROXY/HTTP_PROXY even for 127.0.0.1, so the debug-port check hung behind a proxy. Fix: proxy-less opener for localhost.
+- 2026-11-13: Ban risk is per account, not per browser: every profile shares one Costco login. Fix: manual one-at-a-time sign-in by default (--setup), no login retries, default 10 profiles, interval floor 20s (default 45), exponential backoff on blocks. Fingerprint spoofing/proxies deliberately not used.
+- 2026-11-13: device_commit_files re-sent a cached old copy when the same stagedPath was reused (timestamps changed, sizes didn't). Fix: stage updates under a new path and verify size/grep on the device after every push.

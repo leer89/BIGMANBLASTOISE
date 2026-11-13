@@ -195,45 +195,56 @@ async def human_type(page: Page, selector: str, text: str) -> None:
     await el.type(text, delay=random.randint(40, 90))
 
 
-async def ensure_logged_in(tag: str, page: Page, email: str, pw: str, notify) -> bool:
-    """Signs in if needed. Returns True when signed in. Never tries to solve a CAPTCHA:
-    if one shows up (or anything unexpected), it chimes and waits for you to finish."""
-    await load(page, LOGIN_URL)
-    email_sel = "#signInName, input[name='signInName'], input[type='email']"
-    pw_sel = "#password, input[type='password']"
-    try:
-        await page.wait_for_selector(email_sel, timeout=20000)
-    except Exception:
-        # No login form: probably already signed in from a previous run.
-        if "costco.com" in page.url and "signin" not in page.url:
-            log(tag, "already signed in")
-            return True
-        log(tag, f"no login form found at {page.url}")
-        return False
+def on_signin_page(url: str) -> bool:
+    u = url.lower()
+    return "signin.costco.com" in u or "logonform" in u
 
-    await human_type(page, email_sel, email)
-    await asyncio.sleep(random.uniform(0.3, 0.8))
-    await human_type(page, pw_sel, pw)
-    await asyncio.sleep(random.uniform(0.3, 0.8))
-    await page.locator("#next, button[type='submit']").first.click()
 
-    # Wait up to 3 min for the redirect back to www.costco.com. If you get an MFA
-    # code / CAPTCHA screen, finish it by hand in that window and the bot continues.
-    deadline = time.time() + 180
-    warned = False
-    while time.time() < deadline:
-        u = page.url
-        if "www.costco.com" in u and "logon" not in u.lower():
-            log(tag, "signed in")
+async def wait_until_signed_in(tag: str, page: Page, timeout: float) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if "www.costco.com" in page.url and not on_signin_page(page.url):
             return True
-        if not warned and time.time() > deadline - 165:
-            warned = True
-            log(tag, "still on sign-in page: finish it by hand in this window (code/CAPTCHA?)")
-            chime()
-            notify(f"{tag} needs manual sign-in", "Finish sign-in in that Chrome window.")
         await asyncio.sleep(1)
-    log(tag, "sign-in timed out")
     return False
+
+
+async def sign_in(tag: str, page: Page, creds, auto: bool, notify, timeout: float = 600) -> bool:
+    """Opens the sign-in page once. If already signed in (cookies saved in the profile
+    from an earlier run) it returns right away.
+
+    Default is MANUAL: you type the password yourself, once per profile, and the
+    profile remembers it. That's the single biggest ban-risk reduction: no scripted
+    typing into Costco's login, and no burst of logins from one account.
+    With --auto-login it fills the form exactly once and never retries on failure
+    (repeated failed logins are what get accounts locked)."""
+    await load(page, LOGIN_URL)
+    await asyncio.sleep(2)
+    if not on_signin_page(page.url):
+        log(tag, "already signed in")
+        return True
+
+    if auto and creds[0]:
+        email_sel = "#signInName, input[name='signInName'], input[type='email']"
+        pw_sel = "#password, input[type='password']"
+        try:
+            await page.wait_for_selector(email_sel, timeout=20000)
+            await asyncio.sleep(random.uniform(1.5, 3.5))  # people don't type instantly
+            await human_type(page, email_sel, creds[0])
+            await asyncio.sleep(random.uniform(0.8, 2.0))
+            await human_type(page, pw_sel, creds[1])
+            await asyncio.sleep(random.uniform(0.8, 2.0))
+            await page.locator("#next, button[type='submit']").first.click()
+        except Exception as e:
+            log(tag, f"auto sign-in form not as expected ({e.__class__.__name__}), switching to manual")
+
+    log(tag, "waiting for you to finish signing in in this window")
+    await page.bring_to_front()
+    chime()
+    notify(f"{tag} needs sign-in", "Finish signing in in that Chrome window.")
+    ok = await wait_until_signed_in(tag, page, timeout)
+    log(tag, "signed in" if ok else "sign-in not completed, continuing signed out")
+    return ok
 
 
 # --------------------------------------------------------------------------- chrome
@@ -280,6 +291,7 @@ class Shared:
         self.found = asyncio.Event()       # someone reached BUYABLE
         self.winner: str | None = None
         self.alarm = Alarm()
+        self.signin_lock = asyncio.Lock()  # one sign-in at a time, never a burst
 
 
 async def run_profile(pw_api, chrome: str, idx: int, args, creds, shared: Shared, notify) -> None:
@@ -292,10 +304,15 @@ async def run_profile(pw_api, chrome: str, idx: int, args, creds, shared: Shared
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
 
         if not args.skip_login:
-            if not await ensure_logged_in(tag, page, *creds, notify=notify):
-                log(tag, "continuing without confirmed sign-in")
+            async with shared.signin_lock:
+                await sign_in(tag, page, creds, args.auto_login, notify)
+                await asyncio.sleep(random.uniform(5, 12))  # space out logins on one account
+        if args.setup:
+            log(tag, "setup done for this profile")
+            return
 
         is_scout = idx == args.start
+        blocked_strikes = 0
         if not is_scout:
             await load(page, HOME_URL)
             log(tag, "idle, waiting for scout")
@@ -333,16 +350,30 @@ async def run_profile(pw_api, chrome: str, idx: int, args, creds, shared: Shared
                         break
                 continue  # re-classify where the queue dropped us
 
-            if state == NEEDS_LOGIN and not args.skip_login:
-                await ensure_logged_in(tag, page, *creds, notify=notify)
+            if state == NEEDS_LOGIN:
+                # Never auto-retry logins mid-run: just ask you to do it.
+                log(tag, "signed out. Sign in by hand in this window.")
+                chime()
+                notify(f"{tag} signed out", "Sign in by hand in that window.", args.url)
+                await wait_until_signed_in(tag, page, 600)
                 continue
 
             if state == BLOCKED:
-                log(tag, "blocked by Costco bot protection, backing off 2 min")
-                await asyncio.sleep(120)
+                # Back off hard and get slower each time. Hammering a block is how a
+                # temporary block becomes an account flag.
+                blocked_strikes += 1
+                wait = min(120 * 2 ** (blocked_strikes - 1), 1800)
+                log(tag, f"blocked by Costco (strike {blocked_strikes}), pausing {wait // 60} min")
+                chime()
+                if is_scout:
+                    notify("Costco is blocking the scout", f"Pausing {wait // 60} min. Consider fewer windows / longer --interval.")
+                await asyncio.sleep(wait)
                 continue
+            blocked_strikes = 0
 
-            await asyncio.sleep(args.interval + random.uniform(0, args.interval * 0.5))
+            # Scout polls at --interval; the others (only active after go-live) poll half as often.
+            base = args.interval if is_scout else args.interval * 2
+            await asyncio.sleep(base + random.uniform(0, base * 0.5))
     except Exception as e:
         log(tag, f"error: {e}")
     finally:
@@ -354,20 +385,25 @@ async def run_profile(pw_api, chrome: str, idx: int, args, creds, shared: Shared
 
 async def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--count", type=int, default=30, help="number of Chrome profiles (default 30)")
+    ap.add_argument("--count", type=int, default=10, help="number of Chrome profiles (default 10; more = more ban risk)")
     ap.add_argument("--start", type=int, default=1, help="first profile number")
     ap.add_argument("--sku", default=DEFAULT_SKU)
     ap.add_argument("--url", default=None, help="full product URL (overrides --sku)")
-    ap.add_argument("--interval", type=float, default=20, help="scout reload seconds (default 20)")
-    ap.add_argument("--stagger", type=float, default=6, help="seconds between launching profiles")
+    ap.add_argument("--interval", type=float, default=45, help="scout reload seconds (default 45, floor 20)")
+    ap.add_argument("--stagger", type=float, default=15, help="seconds between launching profiles")
+    ap.add_argument("--setup", action="store_true", help="just sign each profile in, one at a time, then exit")
+    ap.add_argument("--auto-login", action="store_true", help="type credentials from costco.env (riskier than signing in by hand)")
     ap.add_argument("--chrome", default=None, help="path to chrome.exe")
     ap.add_argument("--ntfy", default=os.environ.get("NTFY_TOPIC"), help="ntfy.sh topic for phone pings")
     ap.add_argument("--skip-login", action="store_true")
     ap.add_argument("--close-on-exit", action="store_true")
     args = ap.parse_args()
     args.url = args.url or PRODUCT_URL_TMPL.format(sku=args.sku)
+    if args.interval < 20 and not os.environ.get("COSTCO_BOT_HEADLESS"):
+        log("main", f"--interval {args.interval} is too aggressive, using 20")
+        args.interval = 20
 
-    creds = (None, None) if args.skip_login else load_creds(ENV_FILE)
+    creds = load_creds(ENV_FILE) if args.auto_login else (None, None)
     chrome = find_chrome(args.chrome)
     shared = Shared()
     notify = lambda title, body, url=None: push(args.ntfy, title, body, url)
@@ -378,6 +414,11 @@ async def main() -> None:
         for i in range(args.start, args.start + args.count):
             tasks.append(asyncio.create_task(run_profile(p, chrome, i, args, creds, shared, notify)))
             await asyncio.sleep(args.stagger)
+
+        if args.setup:
+            await asyncio.gather(*tasks)
+            log("main", "setup finished. Close the windows, then run without --setup.")
+            return
 
         await shared.found.wait()
         # Keep beeping until Enter.
