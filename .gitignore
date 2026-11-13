@@ -1,0 +1,4 @@
+costco.env
+*.env
+profiles/
+__pycache__/
